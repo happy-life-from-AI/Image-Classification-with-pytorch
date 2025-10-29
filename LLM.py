@@ -58,7 +58,7 @@ if __name__ == "__main__":
         model='llava:13b',
         prompt=prompt,
         images=[image_b64],   # Base64 문자열 배열
-        stream= False  
+        stream= False  ## 응답을 한번에 모두 받아와서 결과 진행ㄹ
     )
     
     answer = res.get('response','')
