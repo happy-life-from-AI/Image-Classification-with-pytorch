@@ -1,40 +1,49 @@
 # -*- coding: utf-8 -*-
 """
-긴 이미지(128x256x3: 좌/우 128x128x3) 자동 분류 스크립트
-- NORMAL_DIR의 정상 이미지로 임계값 τ 자동 캘리브레이션
-- TEST_DIR의 이미지들을 좌/우로 분할해 임베딩 코사인 유사도로 양품/불량 분류
+긴 이미지(128x256x3: 좌/우 128x128x3) 자동 분류 스크립트 - Ollama VLM 기반
+- NORMAL_DIR의 정상 이미지로 임계값 τ 자동 캘리브레이션(유사도 하위 q 분위수)
+- TEST_DIR의 이미지들을 좌/우로 분할해 Ollama(멀티모달)에게 비교 요청
+- Ollama가 반환한 similarity(0~1)를 사용해 양품/불량 분류
 - 결과를 CSV로 저장
 
 필요 패키지:
-  pip install transformers pillow torch numpy
+  pip install pillow numpy requests
+사전 준비:
+  - Ollama 설치 후 모델 다운로드 예:
+      ollama pull llama3.2-vision
+    (또는 llava)
 """
 
 import os
 import csv
 import json
 import glob
+import base64
+import re
 from typing import Tuple, List, Dict, Optional
 
 import numpy as np
+import requests
 from PIL import Image
-
-import torch
-from transformers import AutoProcessor, AutoModelForVision2Seq
 
 # =========================
 # CONFIG: 여기만 수정하세요
 # =========================
 NORMAL_DIR = r"./Images/normal"   # 정상(캘리브레이션) 긴 이미지 폴더
 TEST_DIR   = r"./Images/test"     # 테스트(분류) 긴 이미지 폴더
-MODEL_ID   = "meta-llama/Llama-3.2-Vision-Instruct"  # 임베딩용 비전 모델 ID
-OUT_CSV    = None  # None이면 TEST_DIR/result.csv 로 저장
+
+OLLAMA_HOST = "http://localhost:11434"
+MODEL_NAME  = "llama3.2-vision"   # 또는 "llava", 환경에 맞게 변경
+TIMEOUT_SEC = 120                 # Ollama 요청 타임아웃
+
+OUT_CSV     = None  # None이면 TEST_DIR/result.csv 로 저장
 
 # 이미지 크기/전처리
 EXPECTED_HEIGHT = 128
 EXPECTED_WIDTH  = 256
 ALLOW_RESIZE    = True   # 128x256이 아니어도 강제 리사이즈
 
-# 캘리브레이션 하위 분위수(q): 정상-정상 유사도 분포의 하위 q를 τ로 설정
+# 캘리브레이션 하위 분위수(q): 정상 유사도 분포의 하위 q를 τ로 설정
 CALIB_QUANTILE  = 0.10   # 10% 권장(오탐 줄이기)
 
 # 확장자
@@ -62,37 +71,91 @@ def split_long_image(img: Image.Image,
     right = img.crop((w // 2, 0, w, h))
     return left, right
 
-# =========================
-# 임베딩(LLM/VLM 비전 타워)
-# =========================
-class VisionEmbedder:
-    def __init__(self, model_id: str, device: Optional[str]=None):
-        self.model_id = model_id
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.processor = AutoProcessor.from_pretrained(model_id)
-        self.model = AutoModelForVision2Seq.from_pretrained(
-            model_id,
-            torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
-        ).to(self.device).eval()
+def to_base64_jpeg(img: Image.Image, quality: int = 92) -> str:
+    from io import BytesIO
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=quality)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-    @torch.no_grad()
-    def embed(self, img: Image.Image) -> np.ndarray:
-        """
-        비전 타워의 마지막 히든 평균 풀링 임베딩을 사용.
-        """
-        inputs = self.processor(images=img, return_tensors="pt").to(self.device)
-        out = self.model.vision_model(
-            pixel_values=inputs["pixel_values"],
-            output_hidden_states=True
-        )
-        h = out.last_hidden_state.mean(dim=1)  # [B, D]
-        h = torch.nn.functional.normalize(h, dim=-1)
-        return h.squeeze(0).float().cpu().numpy()
+# =========================
+# Ollama 호출: 두 이미지 비교 프롬프트
+# =========================
+PROMPT_TEMPLATE = """
+두 개의 이미지를 비교해 유사도 점수를 0.0~1.0 사이로 주고, '양품'(유사) 또는 '불량'(차이 존재)로 라벨링하라.
+반드시 JSON 한 줄만 출력:
+{ "similarity": <0~1>, "label": "양품|불량", "reason": "<간단한 근거>" }
 
-def cosine(a: np.ndarray, b: np.ndarray) -> float:
-    a = a / (np.linalg.norm(a) + 1e-8)
-    b = b / (np.linalg.norm(b) + 1e-8)
-    return float(np.dot(a, b))
+채점 가이드(권장):
+- 거의 동일: similarity 0.90~1.00
+- 약간의 경미한 차이: 0.60~0.89
+- 분명한 차이/결함: 0.00~0.59
+
+이미지는 왼쪽(첫 번째), 오른쪽(두 번째) 순서로 제공된다.
+JSON 외 텍스트는 출력하지 말 것.
+""".strip()
+
+def ollama_compare_two(left_img: Image.Image, right_img: Image.Image) -> Dict:
+    """
+    Ollama /api/generate 엔드포인트로 멀티모달 비교 요청.
+    - 모델이 JSON 한 줄을 반환하도록 프롬프트 강제
+    - 실패 시 보수적으로 similarity=0.0, label="불량"
+    """
+    url = f"{OLLAMA_HOST}/api/generate"
+    b64_left = to_base64_jpeg(left_img)
+    b64_right = to_base64_jpeg(right_img)
+
+    payload = {
+        "model": MODEL_NAME,
+        "prompt": PROMPT_TEMPLATE,
+        "images": [b64_left, b64_right],
+        "stream": False,
+        # 필요 시 temperature 등 추가 가능: "options": {"temperature": 0}
+    }
+
+    try:
+        resp = requests.post(url, json=payload, timeout=TIMEOUT_SEC)
+        resp.raise_for_status()
+        data = resp.json()
+        text = data.get("response", "").strip()
+        # JSON이 아닌 텍스트가 끼는 경우를 대비해 {} 블록만 추출
+        json_str = extract_json_block(text)
+        if json_str is None:
+            # 마지막 시도로 따옴표 수정 등 간단 처리
+            json_str = fallback_to_json_like(text)
+        out = json.loads(json_str)
+        sim = float(out.get("similarity", 0.0))
+        lab = str(out.get("label", "불량")).strip()
+        reason = str(out.get("reason", "")).strip()
+        if lab not in ["양품", "불량"]:
+            lab = "불량"
+        sim = min(max(sim, 0.0), 1.0)
+        return {"similarity": sim, "label": lab, "reason": reason, "raw": text}
+    except Exception as e:
+        return {"similarity": 0.0, "label": "불량", "reason": f"Ollama 실패: {e}", "raw": ""}
+
+def extract_json_block(text: str) -> Optional[str]:
+    """
+    문자열에서 첫 번째 JSON 객체 블록 {...}만 추출
+    """
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not m:
+        return None
+    return m.group(0)
+
+def fallback_to_json_like(text: str) -> str:
+    """
+    매우 단순한 폴백: 숫자/키워드만 추출해 JSON 구성 시도
+    """
+    # similarity 숫자 추출
+    m = re.search(r"similarity[^0-9]*([01]?\.\d+|\d+)", text, flags=re.IGNORECASE)
+    sim = 0.0
+    if m:
+        try:
+            sim = float(m.group(1))
+        except:
+            sim = 0.0
+    label = "양품" if sim >= 0.9 else "불량"
+    return json.dumps({"similarity": float(sim), "label": label, "reason": "fallback"})
 
 # =========================
 # 비교/캘리브레이션/분류
@@ -105,17 +168,16 @@ def list_images(folder: str) -> List[str]:
         files.extend(glob.glob(os.path.join(folder, f"*{ext}")))
     return sorted(files)
 
-def compare_long_image(path: str, embedder: VisionEmbedder,
+def compare_long_image(path: str,
                        expect_hw=(EXPECTED_HEIGHT, EXPECTED_WIDTH),
                        allow_resize=ALLOW_RESIZE) -> Dict:
     img = load_image(path)
     left, right = split_long_image(img, expect_hw=expect_hw, allow_resize=allow_resize)
-    e1 = embedder.embed(left)
-    e2 = embedder.embed(right)
-    s = cosine(e1, e2)
-    return {"path": path, "similarity": s}
+    res = ollama_compare_two(left, right)
+    # 이 스크립트에서는 최종 판정은 임계값 τ로 일관되게 결정
+    return {"path": path, "similarity": float(res.get("similarity", 0.0)), "judge": res}
 
-def calibrate_tau_from_folder(folder: str, embedder: VisionEmbedder,
+def calibrate_tau_from_folder(folder: str,
                               quantile: float=CALIB_QUANTILE,
                               expect_hw=(EXPECTED_HEIGHT, EXPECTED_WIDTH),
                               allow_resize=ALLOW_RESIZE) -> Dict:
@@ -126,7 +188,7 @@ def calibrate_tau_from_folder(folder: str, embedder: VisionEmbedder,
     sims: List[float] = []
     for f in files:
         try:
-            r = compare_long_image(f, embedder, expect_hw=expect_hw, allow_resize=allow_resize)
+            r = compare_long_image(f, expect_hw=expect_hw, allow_resize=allow_resize)
             sims.append(r["similarity"])
         except Exception as e:
             print(f"[WARN] 캘리브레이션 실패: {f} - {e}")
@@ -143,7 +205,7 @@ def calibrate_tau_from_folder(folder: str, embedder: VisionEmbedder,
         "folder": folder
     }
 
-def classify_folder(folder: str, embedder: VisionEmbedder, tau: float,
+def classify_folder(folder: str, tau: float,
                     out_csv: Optional[str]=None,
                     expect_hw=(EXPECTED_HEIGHT, EXPECTED_WIDTH),
                     allow_resize=ALLOW_RESIZE) -> Dict:
@@ -158,7 +220,7 @@ def classify_folder(folder: str, embedder: VisionEmbedder, tau: float,
     rows = []
     for f in files:
         try:
-            r = compare_long_image(f, embedder, expect_hw=expect_hw, allow_resize=allow_resize)
+            r = compare_long_image(f, expect_hw=expect_hw, allow_resize=allow_resize)
             s = r["similarity"]
             label = "양품" if s >= tau else "불량"
             rows.append({"path": f, "similarity": s, "label": label})
@@ -184,12 +246,10 @@ def classify_folder(folder: str, embedder: VisionEmbedder, tau: float,
 # 메인: F5로 바로 실행
 # =========================
 def main():
-    print("[INFO] 모델 로드 중...", MODEL_ID)
-    embedder = VisionEmbedder(model_id=MODEL_ID)
-
+    print(f"[INFO] Ollama 모델: {MODEL_NAME} @ {OLLAMA_HOST}")
     # 1) 캘리브레이션
     print("[INFO] 캘리브레이션 폴더:", NORMAL_DIR)
-    cal = calibrate_tau_from_folder(NORMAL_DIR, embedder)
+    cal = calibrate_tau_from_folder(NORMAL_DIR)
     if "error" in cal:
         raise RuntimeError(f"캘리브레이션 실패: {cal}")
     tau = cal["tau"]
@@ -199,7 +259,7 @@ def main():
     # 2) 테스트 분류
     print("[INFO] 테스트 폴더:", TEST_DIR)
     out_csv = OUT_CSV if OUT_CSV else os.path.join(TEST_DIR, "result.csv")
-    res = classify_folder(TEST_DIR, embedder, tau, out_csv=out_csv)
+    res = classify_folder(TEST_DIR, tau, out_csv=out_csv)
     if "error" in res:
         raise RuntimeError(f"분류 실패: {res}")
 
